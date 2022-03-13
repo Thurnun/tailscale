@@ -14,11 +14,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/user"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -332,6 +334,8 @@ func (srv *server) endSession(s ssh.Session) {
 	delete(srv.activeSessions, s.Context().(ssh.Context).SessionID())
 }
 
+var recordSSH = envknob.Bool("TS_LOG_SSH")
+
 // handleAcceptedSSH handles s once it's been accepted and determined
 // that it should run as local system user lu.
 //
@@ -357,6 +361,24 @@ func (srv *server) handleAcceptedSSH(ctx context.Context, s ssh.Session, ci *ssh
 	// See https://github.com/tailscale/tailscale/issues/4146
 	s.DisablePTYEmulation()
 
+	var rec *recording // or nil if disabled
+	var err error
+	ptyReq, _, isPtyReq := s.Pty()
+	if recordSSH && isPtyReq { // for now only record pty sessions
+		env := envMap(s.Environ())
+		if _, ok := env["TERM"]; !ok {
+			env["TERM"] = "xterm-256color" // something non-empty
+		}
+		rec, err = srv.startNewRecording(ptyReq.Window, env)
+		if err != nil {
+			fmt.Fprintf(s, "can't start new recording\n")
+			logf("startNewRecording: %v", err)
+			s.Exit(1)
+			return
+		}
+		defer rec.Close()
+	}
+
 	cmd, stdin, stdout, stderr, err := srv.launchProcess(ctx, s, ci, lu)
 	if err != nil {
 		logf("start failed: %v", err.Error())
@@ -372,7 +394,7 @@ func (srv *server) handleAcceptedSSH(ctx context.Context, s ssh.Session, ci *ssh
 		go srv.handleSessionTermination(ctx, s, ci, cmd, &exitOnce)
 	}
 	go func() {
-		_, err := io.Copy(stdin, s)
+		_, err := io.Copy(rec.writer("i", stdin), s)
 		if err != nil {
 			// TODO: don't log in the success case.
 			logf("ssh: stdin copy: %v", err)
@@ -380,7 +402,7 @@ func (srv *server) handleAcceptedSSH(ctx context.Context, s ssh.Session, ci *ssh
 		stdin.Close()
 	}()
 	go func() {
-		_, err := io.Copy(s, stdout)
+		_, err := io.Copy(rec.writer("o", s), stdout)
 		if err != nil {
 			// TODO: don't log in the success case.
 			logf("ssh: stdout copy: %v", err)
@@ -508,4 +530,139 @@ func matchesPrincipal(ps []*tailcfg.SSHPrincipal, ci *sshConnInfo) bool {
 		}
 	}
 	return false
+}
+
+// startNewRecording starts a new SSH session recording.
+//
+// It writes an asciinema file to
+// $TAILSCALE_VAR_ROOT/ssh-sessions/ssh-session-<unixtime>-*.cast.
+func (s *server) startNewRecording(w ssh.Window, env map[string]string) (*recording, error) {
+	now := time.Now()
+	rec := &recording{
+		server: s,
+		start:  now,
+	}
+	varRoot := s.lb.TailscaleVarRoot()
+	if varRoot == "" {
+		return nil, errors.New("no var root for recording storage")
+	}
+	dir := filepath.Join(varRoot, "ssh-sessions")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil, err
+	}
+	f, err := ioutil.TempFile(dir, fmt.Sprintf("ssh-session-%v-*.cast", now.UnixNano()))
+	if err != nil {
+		return nil, err
+	}
+	rec.out = f
+
+	// {"version": 2, "width": 221, "height": 84, "timestamp": 1647146075, "env": {"SHELL": "/bin/bash", "TERM": "screen"}}
+	type CastHeader struct {
+		Version   int               `json:"version"`
+		Width     int               `json:"width"`
+		Height    int               `json:"height"`
+		Timestamp int64             `json:"timestamp"`
+		Env       map[string]string `json:"env"`
+	}
+	j, err := json.Marshal(CastHeader{
+		Version:   2,
+		Width:     w.Width,
+		Height:    w.Height,
+		Timestamp: now.Unix(),
+		Env:       env,
+	})
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	s.logf("starting asciinema recording to %s", f.Name())
+	j = append(j, '\n')
+	if _, err := f.Write(j); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return rec, nil
+}
+
+// recording is the state for an SSH session recording.
+type recording struct {
+	server *server
+	start  time.Time
+
+	mu  sync.Mutex // guards writes to, close of out
+	out *os.File   // nil if closed
+}
+
+func (r *recording) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.out == nil {
+		return nil
+	}
+	err := r.out.Close()
+	r.out = nil
+	return err
+}
+
+// writer returns an io.Writer around w that first records the write.
+//
+// The dir should be "i" for input or "o" for output.
+//
+// If r is nil, it returns w unchanged.
+func (r *recording) writer(dir string, w io.Writer) io.Writer {
+	if r == nil {
+		return w
+	}
+	return &loggingWriter{r, dir, w}
+}
+
+// loggingWriter is an io.Writer wrapper that writes first an
+// asciinema JSON cast format recording line, and then writes to w.
+type loggingWriter struct {
+	r   *recording
+	dir string    // "i" or "o" (input or output)
+	w   io.Writer // underlying Writer, after writing to r.out
+}
+
+func (w loggingWriter) Write(p []byte) (n int, err error) {
+	j, err := json.Marshal([]interface{}{
+		time.Since(w.r.start).Seconds(),
+		w.dir,
+		string(p),
+	})
+	if err != nil {
+		return 0, err
+	}
+	j = append(j, '\n')
+	if err := w.writeCastLine(j); err != nil {
+		return 0, nil
+	}
+	return w.w.Write(p)
+}
+
+func (w loggingWriter) writeCastLine(j []byte) error {
+	w.r.mu.Lock()
+	defer w.r.mu.Unlock()
+	if w.r.out == nil {
+		return errors.New("logger closed")
+	}
+	_, err := w.r.out.Write(j)
+	if err != nil {
+		return fmt.Errorf("logger Write: %w", err)
+	}
+	return nil
+}
+
+// envMap converts an environment in []string format to a key/value
+// map.
+func envMap(ee []string) (m map[string]string) {
+	m = map[string]string{}
+	for _, e := range ee {
+		i := strings.IndexByte(e, '=')
+		if i == -1 {
+			continue
+		}
+		m[e[:i]] = e[i+1:]
+	}
+	return
 }
