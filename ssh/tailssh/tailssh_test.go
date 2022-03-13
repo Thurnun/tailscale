@@ -214,7 +214,7 @@ func TestSSH(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ss.Handler = func(s ssh.Session) {
-		srv.handleAcceptedSSH(ctx, s, ci, u)
+		srv.handleAcceptedSSH(ctx, s, &tailcfg.SSHAction{Accept: true}, ci, u)
 	}
 
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")

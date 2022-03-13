@@ -68,7 +68,7 @@ func (srv *server) newSSHServer() (*ssh.Server, error) {
 			"direct-tcpip": ssh.DirectTCPIPHandler,
 		},
 		Version:                     "SSH-2.0-Tailscale",
-		LocalPortForwardingCallback: srv.portForward,
+		LocalPortForwardingCallback: srv.localPortForward,
 	}
 	for k, v := range ssh.DefaultRequestHandlers {
 		ss.RequestHandlers[k] = v
@@ -96,16 +96,17 @@ type server struct {
 
 	// mu protects activeSessions.
 	mu             sync.Mutex
-	activeSessions map[string]bool
+	activeSessions map[string]*tailcfg.SSHAction
 }
 
 var debugPolicyFile = envknob.String("TS_DEBUG_SSH_POLICY_FILE")
 
-// portForward reports whether the ctx should be allowed to port forward
+// localPortForward reports whether the ctx should be allowed to port forward
 // to the specified host and port.
 // TODO(bradfitz/maisem): should we have more checks on host/port?
-func (srv *server) portForward(ctx ssh.Context, destinationHost string, destinationPort uint32) bool {
-	return srv.isActiveSession(ctx)
+func (srv *server) localPortForward(ctx ssh.Context, destinationHost string, destinationPort uint32) bool {
+	a, ok := srv.sessionAction(ctx)
+	return ok && a.AllowLocalPortForwarding
 }
 
 // sshPolicy returns the SSHPolicy for current node.
@@ -256,7 +257,7 @@ ProcessAction:
 		})
 		defer t.Stop()
 	}
-	srv.handleAcceptedSSH(ctx, s, ci, lu)
+	srv.handleAcceptedSSH(ctx, s, action, ci, lu)
 }
 
 func (srv *server) fetchSSHAction(ctx context.Context, url string) (*tailcfg.SSHAction, error) {
@@ -307,22 +308,24 @@ func (srv *server) handleSessionTermination(ctx context.Context, s ssh.Session, 
 	})
 }
 
-// isActiveSession reports whether the ssh.Context corresponds
-// to an active session.
-func (srv *server) isActiveSession(sctx ssh.Context) bool {
+// sessionAction returns the SSHAction associated with the session.
+func (srv *server) sessionAction(sctx ssh.Context) (a tailcfg.SSHAction, ok bool) {
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
-	return srv.activeSessions[sctx.SessionID()]
+	if act, ok := srv.activeSessions[sctx.SessionID()]; ok {
+		a = *act
+	}
+	return a, ok
 }
 
 // startSession registers s as an active session.
-func (srv *server) startSession(s ssh.Session) {
+func (srv *server) startSession(s ssh.Session, a *tailcfg.SSHAction) {
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
 	if srv.activeSessions == nil {
-		srv.activeSessions = make(map[string]bool)
+		srv.activeSessions = make(map[string]*tailcfg.SSHAction)
 	}
-	srv.activeSessions[s.Context().(ssh.Context).SessionID()] = true
+	srv.activeSessions[s.Context().(ssh.Context).SessionID()] = a
 }
 
 // endSession unregisters s from the list of active sessions.
@@ -338,8 +341,8 @@ func (srv *server) endSession(s ssh.Session) {
 // When ctx is done, the session is forcefully terminated. If its Err
 // is an SSHTerminationError, its SSHTerminationMessage is sent to the
 // user.
-func (srv *server) handleAcceptedSSH(ctx context.Context, s ssh.Session, ci *sshConnInfo, lu *user.User) {
-	srv.startSession(s)
+func (srv *server) handleAcceptedSSH(ctx context.Context, s ssh.Session, a *tailcfg.SSHAction, ci *sshConnInfo, lu *user.User) {
+	srv.startSession(s, a)
 	defer srv.endSession(s)
 	logf := srv.logf
 	localUser := lu.Username
