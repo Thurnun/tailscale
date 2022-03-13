@@ -19,6 +19,8 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -332,6 +334,42 @@ func (srv *server) endSession(s ssh.Session) {
 	delete(srv.activeSessions, s.Context().(ssh.Context).SessionID())
 }
 
+// handleSSHAgentForwarding starts a Unix socket listener and in the background
+// forwards agent connections between the listenr and the ssh.Session.
+func (srv *server) handleSSHAgentForwarding(s ssh.Session, lu *user.User) (l net.Listener, err error) {
+	srv.logf("ssh: agent forwarding requested")
+	l, err = ssh.NewAgentListener()
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil && l != nil {
+			l.Close()
+		}
+	}()
+
+	uid, err := strconv.ParseUint(lu.Uid, 10, 32)
+	if err != nil {
+		return nil, err
+	}
+	gid, err := strconv.ParseUint(lu.Gid, 10, 32)
+	if err != nil {
+		return nil, err
+	}
+	socket := l.Addr().String()
+	dir := filepath.Dir(socket)
+	// Make sure the socket is accessible by the user.
+	if err := os.Chown(socket, int(uid), int(gid)); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(dir, 0755); err != nil {
+		return nil, err
+	}
+
+	go ssh.ForwardAgentConnections(l, s)
+	return l, nil
+}
+
 // handleAcceptedSSH handles s once it's been accepted and determined
 // that it should run as local system user lu.
 //
@@ -357,7 +395,17 @@ func (srv *server) handleAcceptedSSH(ctx context.Context, s ssh.Session, ci *ssh
 	// See https://github.com/tailscale/tailscale/issues/4146
 	s.DisablePTYEmulation()
 
-	cmd, stdin, stdout, stderr, err := srv.launchProcess(ctx, s, ci, lu)
+	var agentListener net.Listener
+	if ssh.AgentRequested(s) {
+		var err error
+		agentListener, err = srv.handleSSHAgentForwarding(s, lu)
+		if err != nil {
+			logf("ssh: agent forwarding failed: %v", err)
+		} else {
+			defer agentListener.Close()
+		}
+	}
+	cmd, stdin, stdout, stderr, err := srv.launchProcess(ctx, s, ci, lu, agentListener)
 	if err != nil {
 		logf("start failed: %v", err.Error())
 		s.Exit(1)

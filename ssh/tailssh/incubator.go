@@ -19,6 +19,7 @@ import (
 	"io"
 	"log"
 	"log/syslog"
+	"net"
 	"os"
 	"os/exec"
 	"os/user"
@@ -158,7 +159,7 @@ func beIncubator(args []string) error {
 // launchProcess launches an incubator process for the provided session.
 // It is responsible for configuring the process execution environment.
 // The caller can wait for the process to exit by calling cmd.Wait().
-func (srv *server) launchProcess(ctx context.Context, s ssh.Session, ci *sshConnInfo, lu *user.User) (cmd *exec.Cmd, stdin io.WriteCloser, stdout, stderr io.Reader, err error) {
+func (srv *server) launchProcess(ctx context.Context, s ssh.Session, ci *sshConnInfo, lu *user.User, agentListener net.Listener) (cmd *exec.Cmd, stdin io.WriteCloser, stdout, stderr io.Reader, err error) {
 	shell := loginShell(lu.Uid)
 	var args []string
 	if rawCmd := s.RawCommand(); rawCmd != "" {
@@ -166,7 +167,6 @@ func (srv *server) launchProcess(ctx context.Context, s ssh.Session, ci *sshConn
 	} else {
 		args = append(args, "-l") // login shell
 	}
-	ptyReq, winCh, isPty := s.Pty()
 
 	cmd = newIncubatorCommand(ctx, ci, lu, srv.tailscaledPath, shell, args)
 	cmd.Dir = lu.HomeDir
@@ -176,8 +176,13 @@ func (srv *server) launchProcess(ctx context.Context, s ssh.Session, ci *sshConn
 		fmt.Sprintf("SSH_CLIENT=%s %d %d", ci.src.IP(), ci.src.Port(), ci.dst.Port()),
 		fmt.Sprintf("SSH_CONNECTION=%s %d %s %d", ci.src.IP(), ci.src.Port(), ci.dst.IP(), ci.dst.Port()),
 	)
+	if agentListener != nil {
+		cmd.Env = append(cmd.Env, fmt.Sprintf("SSH_AUTH_SOCK=%s", agentListener.Addr()))
+	}
+
 	srv.logf("ssh: starting: %+v", cmd.Args)
 
+	ptyReq, winCh, isPty := s.Pty()
 	if !isPty {
 		stdin, stdout, stderr, err = startWithStdPipes(cmd)
 		return
